@@ -9,6 +9,7 @@ created time: 2015-01-17
 
 #include "relocate.h"
 
+// page base 때문일듯?
 #define ALIGN_PC(pc)	(pc & 0xFFFFFFFC)
 
 enum INSTRUCTION_TYPE {
@@ -19,6 +20,7 @@ enum INSTRUCTION_TYPE {
 	// BX PC
 	BX_THUMB16,
 	// ADD <Rdn>, PC (Rd != PC, Rn != PC) 在对ADD进行修正时，采用了替换PC为Rr的方法，当Rd也为PC时，由于之前更改了Rr的值，可能会影响跳转后的正常功能。
+	// ADD 수정시 PC를 Rr로 바꾸는 방법을 사용함. Rd 가 PC라면, 아마도 Rr가 전에 변경된 것이므로, jump이후 정상기능 에 영향을 줄수 있다.
 	ADD_THUMB16,
 	// MOV Rd, PC
 	MOV_THUMB16,
@@ -59,6 +61,7 @@ enum INSTRUCTION_TYPE {
 	// BX PC
 	BX_ARM,
 	// ADD Rd, PC, Rm (Rd != PC, Rm != PC) 在对ADD进行修正时，采用了替换PC为Rr的方法，当Rd也为PC时，由于之前更改了Rr的值，可能会影响跳转后的正常功能;实际汇编中没有发现Rm也为PC的情况，故未做处理。
+	// 위 번역 + 실제 컴파일에서 Rm이 PC 인 경우는 발견되지 않았으므로 처리되지 않았습니다.
 	ADD_ARM,
 	// ADR Rd, <label>
 	ADR1_ARM,
@@ -140,7 +143,7 @@ static int getTypeInThumb32(uint32_t instruction)
 
 static int getTypeInArm(uint32_t instruction)
 {
-	if ((instruction & 0xFE000000) == 0xFA000000) {
+	if ((instruction & 0xFE000000) == 0xFA000000) { // http://engold.ui.ac.ir/~nikmehr/Appendix_B2.pdf 랑 비교해 보니 맞음. 
 		return BLX_ARM;
 	}
 	if ((instruction & 0xF000000) == 0xB000000) {
@@ -462,8 +465,8 @@ static void relocateInstructionInThumb(uint32_t target_addr, uint16_t *orig_inst
 		++(*count);
 		
 		if ((orig_instructions[orig_pos] >> 11) >= 0x1D && (orig_instructions[orig_pos] >> 11) <= 0x1F) {
-			if (orig_pos + 2 > length / sizeof(uint16_t)) {
-				break;
+			if (orig_pos + 2 > length / sizeof(uint16_t)) { //  length / sizeof(uint16_t)는 12/2 = 6 ( 8byte가 원본에 쓰이니까,. 8byte만 트램폴린에 써야 할거 같은데.. )
+				break; // orig_pos는 4면 break.. 즉 8byte 긴하네.. 
 			}
 			offset = relocateInstructionInThumb32(pc, orig_instructions[orig_pos], orig_instructions[orig_pos + 1], &trampoline_instructions[trampoline_pos]);
 			pc += sizeof(uint32_t);
@@ -478,6 +481,8 @@ static void relocateInstructionInThumb(uint32_t target_addr, uint16_t *orig_inst
 		}
 		
 		if (orig_pos >= length / sizeof(uint16_t)) {
+			//  length / sizeof(uint16_t)는 12/2 = 6 ( 8byte가 원본에 쓰이니까,. 8byte만 트램폴린에 써야 할거 같은데.. )
+			// 즉 orig_pos가 6이면 break ..인데 이경우 12byte 를 트램폴린에 썻다는말?
 			break;
 		}
 	}
@@ -491,34 +496,74 @@ static void relocateInstructionInThumb(uint32_t target_addr, uint16_t *orig_inst
 	trampoline_instructions[trampoline_pos + 3] = lr >> 16;
 }
 
+/*
+target_addr: the address of the target function to be Hooked, which is the current PC value, used to modify the instruction
+orig_instructions: the first address of the original instruction, used to modify the instruction and subsequent restoration of the original instruction
+length: the length of the original instruction stored, the Arm instruction is 8 bytes; the Thumb instruction is 12 bytes
+trampoline_instructions: Store the first address of the revised instruction, used to call the original function
+orig_boundaries: Stores the instruction boundaries of the original instructions (the so-called boundary is the offset of the instruction from the starting address), which is used in subsequent thread processing to migrate the PC
+trampoline_boundaries: instruction boundary for storing modified instructions, the same purpose as above
+count: the number of instructions processed, the purpose is the same as above
+*/
+/*
+* target_addr
+* orig_instructions* : 타겟의 프롤로그 ( item 에 복사한..)
+* length : orig_instructions 크기
+* trampoline_instructions* :
+* orig_boundaries* :
+* count* :  바운더리 카운트 ( )
+* 목적 : 맞네.. 함수 중간에 hooking시 branch면 addr 값 수정해야 하고 26bit?이상이면 instruction도 변경해야 하고, bl 이면 lr 까지 수정해 줘야 한다. 
+* + trampoline 코드 생성 { 오리지널 코드 2개 + 복귀 코드 } => 트램펄린 이라는 용어가 hooking 코드를 의미하는게 일반적인거 같긴한데,, 여기는 그건 아님. (이걸 트램펄린 이라고 하기도 하는거 같고.)
+*/
 static void relocateInstructionInArm(uint32_t target_addr, uint32_t *orig_instructions, int length, uint32_t *trampoline_instructions, int *orig_boundaries, int *trampoline_boundaries, int *count)
 {
-	uint32_t pc;
-	uint32_t lr;
-	int orig_pos;
-	int trampoline_pos;
+	uint32_t pc; // 이건 pc겠고. 
+	uint32_t lr; // link reg 겠지.
+	int orig_pos; // index네.. .orig_instructions위치에서 instuction 에 대한 index..
+	int trampoline_pos;  // index네.
 
-	pc = target_addr + 8;
-	lr = target_addr + length;
+	pc = target_addr + 8; // pc relative한 inst 때문이 맞는듯, target이 실행될때 pc는 target+8 (fetch.)니까. 
+	lr = target_addr + length; // arm일때 8 이고 target의 inst 2개만 수정한다면 lr은 이게 맞다. (trampoline_instructions에만 씀. )
 
 	trampoline_pos = 0;
-	for (orig_pos = 0; orig_pos < length / sizeof(uint32_t); ++orig_pos) {
+	for (orig_pos = 0; orig_pos < length / sizeof(uint32_t); ++orig_pos) { // target의 prologe inst 갯수 만큼 for. 
 		uint32_t instruction;
 		int type;
 
-		orig_boundaries[*count] = orig_pos * sizeof(uint32_t);
+		// 바운더리들은 여기서 쓰지는 않는다.
+		orig_boundaries[*count] = orig_pos * sizeof(uint32_t);  // instuction의 0기준 addr? (0, 4, 8 )
 		trampoline_boundaries[*count] = trampoline_pos * sizeof(uint32_t);
 		++(*count);
 
-		instruction = orig_instructions[orig_pos];
-		type = getTypeInArm(instruction);
+		instruction = orig_instructions[orig_pos]; // instuction 값 가져옴. 
+		type = getTypeInArm(instruction);  // 무슨 inst 인지 확인 하고. ( inst 앞 opcode확인. )
+		
+		// 아래가 핵심
+		// 근데 branch regisger는 없는건가???
+		// https://stackoverflow.com/questions/17398343/decoding-blx-instruction-on-arm-thumbandroid
+		// decodding.. 
+			/*
+				any_instruction   
+				blx 일때  ( any_inst랑 blx 순서 바뀌어도 상관 없네. )
+				------------------------------------------------------
+				any_instruction
+				+ ADD LR, PC, #4     // blx대신
+				+ LDR PC, [PC, #-4]  // blx대신
+				+ 수정된 addr         // blx대신
+				LDR PC, [PC, #-4]    // lr은 여기가 된다.
+				lr
+			*/
 		if (type == BLX_ARM || type == BL_ARM || type == B_ARM || type == BX_ARM) {
-			uint32_t x;
-			int top_bit;
-			uint32_t imm32;
-			uint32_t value;
+			/*
+			* branch를 branch inst 대신 최대 3개의 instruction 조합으로 만드는 코드
+			* 핵심은 imm32 만드는 것과 lr 설정하는 것. ( bl, blx 의 경우 )
+			*/
+			uint32_t x; // imm32(value) 만드는 중간 값
+			int top_bit; // imm32(value) 만드는 중간 값
+			uint32_t imm32; // inst에 박힌 값. 
+			uint32_t value; // branch의 수정한 jmp address
 
-			if (type == BLX_ARM || type == BL_ARM) {
+			if (type == BLX_ARM || type == BL_ARM) { // lr 수정하는 branch. 
 				trampoline_instructions[trampoline_pos++] = 0xE28FE004;	// ADD LR, PC, #4
 			}
 			trampoline_instructions[trampoline_pos++] = 0xE51FF004;  	// LDR PC, [PC, #-4]
@@ -532,10 +577,10 @@ static void relocateInstructionInArm(uint32_t target_addr, uint32_t *orig_instru
 				x = 0;
 			}
 			
-			top_bit = x >> 25;
+			top_bit = x >> 25; // signed라서.. 그거 보수 계산 .. 뭐 그런거 같은데.. 
 			imm32 = top_bit ? (x | (0xFFFFFFFF << 26)) : x;
 			if (type == BLX_ARM) {
-				value = pc + imm32 + 1;
+				value = pc + imm32 + 1; // 1왜 붙이지? 원래 blx imm24일땐 무조건 thumb 인가?
 			}
 			else {
 				value = pc + imm32;
@@ -544,23 +589,33 @@ static void relocateInstructionInArm(uint32_t target_addr, uint32_t *orig_instru
 			
 		}
 		else if (type == ADD_ARM) {
+			/*
+			* ADR Rd, <label> 과 같은 형태?? 인가봄.. 여기서 label이 pc 랑 연관되어 있다고 함.. 
+			*/
 			int rd;
 			int rm;
 			int r;
-			
+			// Parse the instruction to get the rd and rm registers
 			rd = (instruction & 0xF000) >> 12;
 			rm = instruction & 0xF;
 			
+			// 뭔가 쓰지 않는 reg 를 찾는거 같네.. 
+			// To avoid conflicts, exclude the rd and rm registers and select a temporary register Rr
 			for (r = 12; ; --r) {
 				if (r != rd && r != rm) {
 					break;
 				}
 			}
 			
+			// PUSH {Rr}, protect Rr register value
 			trampoline_instructions[trampoline_pos++] = 0xE52D0004 | (r << 12);	// PUSH {Rr}
+			// LDR Rr, [PC, # 8], store PC value in Rr register
 			trampoline_instructions[trampoline_pos++] = 0xE59F0008 | (r << 12);	// LDR Rr, [PC, #8]
+			// Transform the original instruction `ADR Rd, <label>` into `ADR Rd, Rr,?`
 			trampoline_instructions[trampoline_pos++] = (instruction & 0xFFF0FFFF) | (r << 16);
+			// POP {Rr}, restore Rr register value
 			trampoline_instructions[trampoline_pos++] = 0xE49D0004 | (r << 12);	// POP {Rr}
+			// ADD PC, PC, skip next instruction
 			trampoline_instructions[trampoline_pos++] = 0xE28FF000;	// ADD PC, PC
 			trampoline_instructions[trampoline_pos++] = pc;
 		}

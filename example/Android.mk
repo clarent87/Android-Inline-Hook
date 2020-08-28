@@ -26,4 +26,7 @@ include $(CLEAR_VARS)
 LOCAL_MODULE    := hooktest
 LOCAL_SRC_FILES := hooktest.c
 LOCAL_STATIC_LIBRARIES := libhook
+# ifeq ($(APP_OPTIM),debug)
+#     cmd-strip := 
+# endif
 include $(BUILD_EXECUTABLE)
